@@ -1,0 +1,51 @@
+﻿@model DocMgmt.Services.ExtractedDocumentContent
+
+<div class="document-preview-wrapper" style="max-height: 550px; overflow: auto; border: 1px solid #dee2e6; border-radius: 4px;">
+    @if (Model.IsExcel)
+    {
+        @if (Model.GridRows != null && Model.GridRows.Any())
+        {
+            <table class="table table-bordered table-striped mb-0" style="width:100%; border-collapse: collapse; background: #fff; font-size: 14px;">
+                <tbody>
+                    @foreach (var row in Model.GridRows)
+                    {
+                        <tr>
+                            @foreach (var cell in row)
+                            {
+                                <td style="border: 1px solid #dee2e6; padding: 8px; min-width: 100px; white-space: nowrap;">
+                                    @if (string.IsNullOrWhiteSpace(cell))
+                                    {
+                                        <span>&nbsp;</span>
+                                    }
+                                    else
+                                    {
+                                        @cell
+                                    }
+                                </td>
+                            }
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+        else
+        {
+            <div class="p-4 text-center text-muted bg-white font-italic">
+                The spreadsheet contains no visible row data rows.
+            </div>
+        }
+    }
+    else
+    {
+        <div class="card border-0 p-4 shadow-sm" style="white-space: pre-wrap; font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; background: #fff; color: #333;">
+            @if (string.IsNullOrWhiteSpace(Model.RawBodyText))
+            {
+                <span class="text-muted font-italic">Empty text document body content.</span>
+            }
+            else
+            {
+                @Model.RawBodyText
+            }
+        </div>
+    }
+</div>
