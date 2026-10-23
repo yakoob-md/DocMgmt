@@ -6,10 +6,10 @@
 
 <div class="container mt-4">
     <div class="row">
-        <!-- LEFT PANEL: Original upload forms and transaction logs -->
+        <!-- LEFT PANEL: upload form and version history -->
         <div class="col-md-5">
             <div class="card shadow-sm border-0 mb-4">
-                <div class="card-header bg-primary text-white font-weight-bold">
+                <div class="card-header bg-primary text-white fw-bold">
                     Upload Management Interface
                 </div>
                 <div class="card-body">
@@ -18,27 +18,25 @@
                         <div class="alert alert-success small py-2">@TempData["Success"]</div>
                     }
 
-                    <form asp-action="Upload" method="post" enctype="multipart/form-data">
-                        @Html.AntiForgeryToken()
+                    <form asp-action="Upload" method="post" enctype="multipart/form-data" id="uploadForm">
                         <input type="hidden" asp-for="DocId" />
                         <div asp-validation-summary="ModelOnly" class="text-danger small mb-2"></div>
 
-                        <div class="form-group mb-3">
-                            <label class="form-label font-weight-bold">Select Target File Asset</label>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold" for="documentFileInput">Select Target File Asset</label>
                             <input type="file" asp-for="File" id="documentFileInput" class="form-control" />
                             <span asp-validation-for="File" class="text-danger small"></span>
                         </div>
 
-                        <button type="submit" class="btn btn-success w-100 font-weight-bold">
+                        <button type="submit" class="btn btn-success w-100 fw-bold">
                             Commit Upload Update Version
                         </button>
                     </form>
                 </div>
             </div>
 
-            <!-- Upload Version Control Tracking History -->
             <div class="card shadow-sm border-0">
-                <div class="card-header bg-secondary text-white font-weight-bold">
+                <div class="card-header bg-secondary text-white fw-bold">
                     Database Retention History
                 </div>
                 <div class="card-body p-0">
@@ -49,16 +47,17 @@
                             {
                                 <div class="list-group-item d-flex justify-content-between align-items-center py-2">
                                     <div>
-                                        <h6 class="mb-0 text-truncate" style="max-width: 220px;">@item.FileName</h6>
+                                        <h6 class="mb-0 text-truncate" style="max-width: 200px;" title="@item.FileName">@item.FileName</h6>
                                         <small class="text-muted">@item.UploadedAt?.ToString("g")</small>
                                     </div>
                                     <div class="btn-group">
-                                        <button type="button" class="btn btn-sm btn-outline-primary px-2" onclick="loadSavedPreview(@item.UploadId, '@System.IO.Path.GetExtension(item.FileName).ToLowerInvariant()')">
+                                        <button type="button" class="btn btn-sm btn-outline-primary px-2 js-saved-preview"
+                                                data-file-name="@item.FileName"
+                                                data-preview-url="@Url.Action("Preview", "Documents", new { uploadId = item.UploadId, embed = true })">
                                             Inline
                                         </button>
-                                        <a href="/Documents/Preview?uploadId=@item.UploadId" target="_blank" class="btn btn-sm btn-outline-dark px-2">
-                                            Tab ↗
-                                        </a>
+                                        <a href="@Url.Action("Preview", "Documents", new { uploadId = item.UploadId })" target="_blank" rel="noopener" class="btn btn-sm btn-outline-dark px-2">Tab ↗</a>
+                                        <a href="@Url.Action("Download", "Documents", new { uploadId = item.UploadId })" class="btn btn-sm btn-outline-secondary px-2">Download</a>
                                     </div>
                                 </div>
                             }
@@ -72,16 +71,16 @@
             </div>
         </div>
 
-        <!-- RIGHT PANEL: 100% First-Party Native Live Preview Panel Workspace -->
+        <!-- RIGHT PANEL: live preview -->
         <div class="col-md-7">
             <div class="card shadow-sm border-0 sticky-top" style="top: 20px; z-index: 10;">
-                <div class="card-header bg-dark text-white font-weight-bold d-flex justify-content-between align-items-center">
+                <div class="card-header bg-dark text-white fw-bold d-flex justify-content-between align-items-center">
                     <span>Live Native View Engine Context</span>
                     <span id="stateBadge" class="badge bg-secondary text-uppercase small">Empty</span>
                 </div>
                 <div class="card-body bg-light border p-2" id="previewDisplayPanel" style="min-height: 480px; max-height: 650px; overflow: auto;">
                     <div class="text-center text-muted pt-5 mt-5">
-                        <p class="mb-0 fs-5 font-italic">Select a file from your system directory or choose an item from upload history records to render live contents dynamically.</p>
+                        <p class="mb-0 fs-5 fst-italic">Select a file, or choose an item from the history, to preview it here.</p>
                     </div>
                 </div>
             </div>
@@ -91,75 +90,157 @@
 
 @section Scripts {
     <script>
-        const panel = document.getElementById('previewDisplayPanel');
-        const badge = document.getElementById('stateBadge');
+        (function () {
+            const panel = document.getElementById('previewDisplayPanel');
+            const badge = document.getElementById('stateBadge');
+            const fileInput = document.getElementById('documentFileInput');
+            const previewBeforeSubmitUrl = '@Url.Action("PreviewBeforeSubmit", "Documents")';
 
-        // --- PIPELINE 1: LIVE INTERCEPT BEFORE SUBMISSION STATE ---
-        document.getElementById('documentFileInput')?.addEventListener('change', function (e) {
-            const file = e.target.files[0];
-            if (!file) return;
+            const MAX_BYTES = 100 * 1024 * 1024;
+            const MAX_TEXT_CHARS = 200000;
+            const IMAGE_TYPES = ['.png', '.jpg', '.jpeg', '.gif', '.webp'];
+            const TEXT_TYPES = ['.txt', '.csv'];
 
-            const extension = '.' + file.name.split('.').pop().toLowerCase();
-            badge.innerText = "Before Submit";
-            badge.className = "badge bg-warning text-dark";
+            let currentRequest = null; // lets a newer click cancel an older, slower one
+            let currentBlobUrl = null;
 
-            if (extension === '.docx' || extension === '.xlsx') {
-                panel.innerHTML = '<div class="text-center pt-5 mt-4"><div class="spinner-border text-primary" role="status"></div><p class="mt-2 text-muted">Parsing file structure out of HTTP memory streams...</p></div>';
-
-                let formData = new FormData();
-                formData.append("file", file);
-
-                fetch('/Documents/PreviewBeforeSubmit', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(res => {
-                    if (!res.ok) throw new Error("File conversion streaming error.");
-                    return res.text();
-                })
-                .then(htmlContent => {
-                    panel.innerHTML = htmlContent;
-                })
-                .catch(err => {
-                    panel.innerHTML = `<div class="alert alert-danger m-3 small">${err.message}</div>`;
-                });
+            function extensionOf(name) {
+                const i = name.lastIndexOf('.');
+                return i < 0 ? '' : name.slice(i).toLowerCase();
             }
-            else if (['.pdf', '.png', '.jpg', '.jpeg', '.txt'].includes(extension)) {
-                const localBlobUrl = URL.createObjectURL(file);
 
-                if (extension === '.pdf') {
-                    panel.innerHTML = `<embed src="${localBlobUrl}" type="application/pdf" style="width:100%; height:550px;" />`;
-                } else if (extension === '.txt') {
-                    const reader = new FileReader();
-                    reader.onload = function(evt) {
-                        panel.innerHTML = `<pre class="p-3 bg-white border small m-2" style="white-space: pre-wrap;">${evt.target.result}</pre>`;
-                    };
-                    reader.readAsText(file);
-                } else {
-                    panel.innerHTML = `<div class="text-center p-2"><img src="${localBlobUrl}" class="img-fluid rounded border shadow-sm" style="max-height: 520px;" /></div>`;
+            function setBadge(text, cls) {
+                badge.textContent = text;
+                badge.className = 'badge text-uppercase small ' + cls;
+            }
+
+            function resetPanel() {
+                if (currentRequest) { currentRequest.abort(); currentRequest = null; }
+                if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
+                panel.replaceChildren();
+            }
+
+            function showMessage(kind, text) {
+                resetPanel();
+                const div = document.createElement('div');
+                div.className = 'alert alert-' + kind + ' m-3 small';
+                div.textContent = text;   // textContent, never innerHTML, for anything that isn't server-rendered markup
+                panel.appendChild(div);
+            }
+
+            function showSpinner(text) {
+                resetPanel();
+                const wrap = document.createElement('div');
+                wrap.className = 'text-center pt-5 mt-4';
+                const spinner = document.createElement('div');
+                spinner.className = 'spinner-border text-primary';
+                spinner.setAttribute('role', 'status');
+                const p = document.createElement('p');
+                p.className = 'mt-2 text-muted';
+                p.textContent = text;
+                wrap.append(spinner, p);
+                panel.appendChild(wrap);
+            }
+
+            function showFrame(src, height) {
+                const frame = document.createElement('iframe');
+                frame.src = src;
+                frame.style.cssText = 'width:100%;height:' + height + 'px;border:0;background:#fff;';
+                panel.appendChild(frame);
+            }
+
+            // Fetches server-rendered preview HTML (already HTML-encoded by Razor) and shows it.
+            async function loadServerPreview(url, options, spinnerText) {
+                showSpinner(spinnerText);
+                const controller = new AbortController();
+                currentRequest = controller;
+
+                try {
+                    const response = await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+                    const body = await response.text();
+                    if (controller.signal.aborted) return;
+
+                    if (!response.ok) {
+                        throw new Error(body && body.length < 400 ? body : 'The preview failed (HTTP ' + response.status + ').');
+                    }
+
+                    currentRequest = null;
+                    panel.innerHTML = body;
+                } catch (err) {
+                    if (err.name === 'AbortError') return;
+                    showMessage('danger', err.message || 'The preview failed.');
                 }
-            } else {
-                panel.innerHTML = `<div class="alert alert-secondary m-3 small">Preview unavailable for format type: ${extension}. The file can still be saved directly.</div>`;
             }
-        });
 
-        // --- PIPELINE 2: LIVE RETRIEVAL AFTER SUBMISSION STATE ---
-        function loadSavedPreview(uploadId, extension) {
-            badge.innerText = "Database Record";
-            badge.className = "badge bg-info text-white";
-            panel.innerHTML = '<div class="text-center pt-5 mt-4"><div class="spinner-border text-secondary" role="status"></div><p class="mt-2 text-muted">Retrieving byte matrix from server storage arrays...</p></div>';
+            // ---- Before submit: preview the file the user just picked ----
+            fileInput?.addEventListener('change', async function (e) {
+                const file = e.target.files[0];
+                if (!file) {
+                    resetPanel();
+                    setBadge('Empty', 'bg-secondary');
+                    return;
+                }
 
-            if (extension === '.docx' || extension === '.xlsx') {
-                fetch(`/Documents/Preview?uploadId=${uploadId}`)
-                    .then(res => res.text())
-                    .then(html => { panel.innerHTML = html; })
-                    .catch(() => { panel.innerHTML = '<div class="alert alert-danger m-3 small">Error pulling document components.</div>'; });
-            }
-            else if (['.pdf', '.png', '.jpg', '.jpeg', '.txt'].includes(extension)) {
-                panel.innerHTML = `<iframe src="/Documents/Preview?uploadId=${uploadId}" style="width:100%; height:550px; border:none; background:#fff;"></iframe>`;
-            } else {
-                panel.innerHTML = `<div class="alert alert-secondary m-3 small">Direct inline views are unsupported for ${extension}. Click 'Tab ↗' to force external window verification routing.</div>`;
-            }
-        }
+                const ext = extensionOf(file.name);
+                setBadge('Before Submit', 'bg-warning text-dark');
+
+                if (file.size > MAX_BYTES) {
+                    showMessage('danger', 'This file is larger than the 100 MB upload limit.');
+                    return;
+                }
+
+                if (ext === '.docx' || ext === '.xlsx') {
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    loadServerPreview(previewBeforeSubmitUrl, { method: 'POST', body: formData }, 'Reading ' + file.name + '...');
+                } else if (ext === '.pdf') {
+                    resetPanel();
+                    currentBlobUrl = URL.createObjectURL(file);
+                    showFrame(currentBlobUrl, 550);
+                } else if (IMAGE_TYPES.includes(ext)) {
+                    resetPanel();
+                    currentBlobUrl = URL.createObjectURL(file);
+                    const wrap = document.createElement('div');
+                    wrap.className = 'text-center p-2';
+                    const img = document.createElement('img');
+                    img.src = currentBlobUrl;
+                    img.className = 'img-fluid rounded border shadow-sm';
+                    img.style.maxHeight = '520px';
+                    wrap.appendChild(img);
+                    panel.appendChild(wrap);
+                } else if (TEXT_TYPES.includes(ext)) {
+                    const text = await file.slice(0, MAX_TEXT_CHARS).text();
+                    resetPanel();
+                    const pre = document.createElement('pre');
+                    pre.className = 'p-3 bg-white border small m-2';
+                    pre.style.whiteSpace = 'pre-wrap';
+                    pre.textContent = text + (file.size > MAX_TEXT_CHARS ? '\n\n... (preview truncated)' : '');
+                    panel.appendChild(pre);
+                } else if (ext === '.doc' || ext === '.xls') {
+                    showMessage('secondary', 'Old binary Office formats (' + ext + ') cannot be previewed. Save as .docx / .xlsx to preview. The file can still be uploaded.');
+                } else {
+                    showMessage('secondary', 'Preview is not available for ' + (ext || 'this file type') + '. The file can still be uploaded.');
+                }
+            });
+
+            // ---- After submit: preview a stored version ----
+            document.querySelectorAll('.js-saved-preview').forEach(function (button) {
+                button.addEventListener('click', function () {
+                    const url = button.dataset.previewUrl;
+                    const ext = extensionOf(button.dataset.fileName || '');
+
+                    setBadge('Database Record', 'bg-info text-dark');
+
+                    if (ext === '.docx' || ext === '.xlsx') {
+                        loadServerPreview(url, { method: 'GET' }, 'Loading ' + button.dataset.fileName + '...');
+                    } else if (['.pdf', '.txt', '.csv'].concat(IMAGE_TYPES).includes(ext)) {
+                        resetPanel();
+                        showFrame(url, 550);
+                    } else {
+                        showMessage('secondary', 'Inline preview is not available for ' + (ext || 'this file type') + '. Use Download instead.');
+                    }
+                });
+            });
+        })();
     </script>
 }

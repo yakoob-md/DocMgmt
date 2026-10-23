@@ -1,6 +1,7 @@
 using DocMgmt.Data;
 using DocMgmt.Services;
-using DocMgmt.Controllers; // Ensures the NativeDocumentParser namespace is accessible
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 
 namespace DocMgmt
 {
@@ -10,36 +11,29 @@ namespace DocMgmt
 		{
 			var builder = WebApplication.CreateBuilder(args);
 
-			// 1. Configure Kestrel server limits for Linux/Docker environments (100 MB max request body)
-			builder.Services.Configure<Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerOptions>(options =>
+			// Allow request bodies up to the 100 MB upload limit.
+			builder.Services.Configure<KestrelServerOptions>(options =>
 			{
-				options.Limits.MaxRequestBodySize = 104857600; // 100 MB in bytes
+				options.Limits.MaxRequestBodySize = FileValidator.MaxFileBytes;
 			});
 
-			// 2. Configure HTTP form multipart boundary constraints for heavy file streams
-			builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
+			builder.Services.Configure<FormOptions>(options =>
 			{
-				options.ValueLengthLimit = 104857600;
-				options.MultipartBodyLengthLimit = 104857600; // 100 MB in bytes
+				options.ValueLengthLimit = (int)FileValidator.MaxFileBytes;
+				options.MultipartBodyLengthLimit = FileValidator.MaxFileBytes;
 			});
 
-			// Register MVC services.
 			builder.Services.AddControllersWithViews();
 
-			// Register the application database version manager service.
 			builder.Services.AddScoped<DocumentUploadService>();
 
-			// Register the 100% first-party native OpenXML parsing service engine.
-			builder.Services.AddScoped<NativeDocumentParser>();
+			// Stateless, so one shared instance is enough.
+			builder.Services.AddSingleton<NativeDocumentParser>();
 
-			// Register the SQL Server connection factory.
-			builder.Services.AddSingleton<
-				IDbConnectionFactory,
-				SqlConnectionFactory>();
+			builder.Services.AddSingleton<IDbConnectionFactory, SqlConnectionFactory>();
 
 			var app = builder.Build();
 
-			// Configure the HTTP request pipeline.
 			if (!app.Environment.IsDevelopment())
 			{
 				app.UseExceptionHandler("/Home/Error");
@@ -47,7 +41,7 @@ namespace DocMgmt
 			}
 
 			app.UseHttpsRedirection();
-			app.UseStaticFiles(); // Falls back safely across standard ASP.NET Core environments
+			app.UseStaticFiles();
 			app.UseRouting();
 			app.UseAuthorization();
 

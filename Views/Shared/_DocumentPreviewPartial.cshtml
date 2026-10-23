@@ -1,51 +1,161 @@
-﻿@model DocMgmt.Services.ExtractedDocumentContent
+﻿@using Microsoft.AspNetCore.Html
+@model DocMgmt.Services.ExtractedDocumentContent
 
-<div class="document-preview-wrapper" style="max-height: 550px; overflow: auto; border: 1px solid #dee2e6; border-radius: 4px;">
+@functions {
+    // Runs are built without any whitespace between them so "Hel" + "lo" never renders as "Hel lo".
+    static IHtmlContent RenderRuns(WordParagraph paragraph)
+    {
+        var builder = new HtmlContentBuilder();
+        foreach (var run in paragraph.Runs)
+        {
+            var classes = new List<string>();
+            if (run.Bold) classes.Add("fw-bold");
+            if (run.Italic) classes.Add("fst-italic");
+            if (run.Underline) classes.Add("text-decoration-underline");
+
+            if (classes.Count == 0)
+            {
+                builder.Append(run.Text);
+            }
+            else
+            {
+                builder.AppendHtml("<span class=\"" + string.Join(' ', classes) + "\">");
+                builder.Append(run.Text);
+                builder.AppendHtml("</span>");
+            }
+        }
+        return builder;
+    }
+
+    static string ColumnName(int index)
+    {
+        var name = string.Empty;
+        for (var n = index + 1; n > 0; n = (n - 1) / 26)
+        {
+            name = (char)('A' + (n - 1) % 26) + name;
+        }
+        return name;
+    }
+}
+
+@{
+    var uid = Guid.NewGuid().ToString("N").Substring(0, 8);
+}
+
+<div class="doc-preview">
+    @if (!string.IsNullOrEmpty(Model.Notice))
+    {
+        <div class="alert alert-warning small m-2 py-2">@Model.Notice</div>
+    }
+
     @if (Model.IsExcel)
     {
-        @if (Model.GridRows != null && Model.GridRows.Any())
+        if (Model.Sheets.Count == 0)
         {
-            <table class="table table-bordered table-striped mb-0" style="width:100%; border-collapse: collapse; background: #fff; font-size: 14px;">
-                <tbody>
-                    @foreach (var row in Model.GridRows)
-                    {
-                        <tr>
-                            @foreach (var cell in row)
-                            {
-                                <td style="border: 1px solid #dee2e6; padding: 8px; min-width: 100px; white-space: nowrap;">
-                                    @if (string.IsNullOrWhiteSpace(cell))
-                                    {
-                                        <span>&nbsp;</span>
-                                    }
-                                    else
-                                    {
-                                        @cell
-                                    }
-                                </td>
-                            }
-                        </tr>
-                    }
-                </tbody>
-            </table>
+            <div class="p-4 text-center text-muted bg-white fst-italic">This workbook has no visible worksheets.</div>
         }
         else
         {
-            <div class="p-4 text-center text-muted bg-white font-italic">
-                The spreadsheet contains no visible row data rows.
+            <ul class="nav nav-tabs sheet-tabs px-2 pt-2 bg-light" role="tablist">
+                @for (var i = 0; i < Model.Sheets.Count; i++)
+                {
+                    <li class="nav-item" role="presentation">
+                        <button type="button" class="nav-link py-1 px-3 small @(i == 0 ? "active" : "")"
+                                id="tab-@uid-@i" role="tab"
+                                data-bs-toggle="tab" data-bs-target="#pane-@uid-@i"
+                                aria-controls="pane-@uid-@i" aria-selected="@(i == 0 ? "true" : "false")">@Model.Sheets[i].Name</button>
+                    </li>
+                }
+            </ul>
+
+            <div class="tab-content bg-white">
+                @for (var i = 0; i < Model.Sheets.Count; i++)
+                {
+                    var sheet = Model.Sheets[i];
+                    <div class="tab-pane fade @(i == 0 ? "show active" : "")" id="pane-@uid-@i" role="tabpanel" aria-labelledby="tab-@uid-@i" tabindex="0">
+                        @if (sheet.Rows.Count == 0)
+                        {
+                            <div class="p-4 text-center text-muted fst-italic">This sheet has no data.</div>
+                        }
+                        else
+                        {
+                            <div class="sheet-scroll">
+                                <table class="sheet-grid">
+                                    <thead>
+                                        <tr>
+                                            <th class="sheet-corner"></th>
+                                            @for (var c = 0; c < sheet.ColumnCount; c++)
+                                            {
+                                                <th>@ColumnName(c)</th>
+                                            }
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        @foreach (var row in sheet.Rows)
+                                        {
+                                            <tr>
+                                                <th class="sheet-rownum">@row.Number</th>
+                                                @foreach (var cell in row.Cells)
+                                                {
+                                                    <td>@cell</td>
+                                                }
+                                            </tr>
+                                        }
+                                    </tbody>
+                                </table>
+                            </div>
+                        }
+                    </div>
+                }
             </div>
         }
     }
     else
     {
-        <div class="card border-0 p-4 shadow-sm" style="white-space: pre-wrap; font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; background: #fff; color: #333;">
-            @if (string.IsNullOrWhiteSpace(Model.RawBodyText))
-            {
-                <span class="text-muted font-italic">Empty text document body content.</span>
-            }
-            else
-            {
-                @Model.RawBodyText
-            }
-        </div>
+        if (Model.Blocks.Count == 0)
+        {
+            <div class="p-4 text-center text-muted bg-white fst-italic">This document has no text content.</div>
+        }
+        else
+        {
+            <div class="doc-page">
+                @foreach (var block in Model.Blocks)
+                {
+                    if (block is WordParagraph p)
+                    {
+                        if (p.HeadingLevel > 0)
+                        {
+                            <div class="doc-heading doc-h@(p.HeadingLevel)">@RenderRuns(p)</div>
+                        }
+                        else if (p.IsListItem)
+                        {
+                            <div class="doc-p doc-li" style="margin-left: @((p.ListLevel + 1) * 24)px">@RenderRuns(p)</div>
+                        }
+                        else
+                        {
+                            <div class="doc-p">@RenderRuns(p)</div>
+                        }
+                    }
+                    else if (block is WordTable table)
+                    {
+                        <div class="doc-table-wrap">
+                            <table class="doc-table">
+                                <tbody>
+                                    @foreach (var row in table.Rows)
+                                    {
+                                        <tr>
+                                            @foreach (var cell in row)
+                                            {
+                                                <td colspan="@cell.ColSpan">@cell.Text</td>
+                                            }
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+                }
+            </div>
+        }
     }
 </div>

@@ -1,0 +1,26 @@
+﻿@model DocMgmt.Models.DocumentPreviewPageViewModel
+
+@{
+    ViewData["Title"] = "Preview - " + Model.FileName;
+}
+
+<div class="container-fluid mt-3">
+    <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+        <h5 class="mb-0 text-truncate" style="max-width: 70%;">@Model.FileName</h5>
+        <div class="btn-group">
+            <a class="btn btn-sm btn-outline-secondary" asp-action="Upload" asp-route-docId="@Model.DocId">&larr; Back to uploads</a>
+            <a class="btn btn-sm btn-outline-primary" asp-action="Download" asp-route-uploadId="@Model.UploadId">Download</a>
+        </div>
+    </div>
+
+    @if (Model.Content is not null)
+    {
+        <div class="doc-preview-full border rounded bg-light">
+            <partial name="_DocumentPreviewPartial" model="Model.Content" />
+        </div>
+    }
+    else
+    {
+        <div class="alert alert-danger">@(Model.ErrorMessage ?? "The preview could not be generated.")</div>
+    }
+</div>

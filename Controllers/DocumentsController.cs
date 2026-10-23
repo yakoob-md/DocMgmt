@@ -1,33 +1,23 @@
-﻿using Dapper;
-using DocMgmt.Data;
-using DocMgmt.Models;
+﻿using DocMgmt.Models;
 using DocMgmt.Services;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Xml;
 
 namespace DocMgmt.Controllers
 {
 	public class DocumentsController : Controller
 	{
 		private readonly DocumentUploadService _uploadService;
-		private readonly IDbConnectionFactory _connectionFactory;
 		private readonly ILogger<DocumentsController> _logger;
 		private readonly NativeDocumentParser _documentParser;
 
 		public DocumentsController(
 			DocumentUploadService uploadService,
-			IDbConnectionFactory connectionFactory,
 			ILogger<DocumentsController> logger,
 			NativeDocumentParser documentParser)
 		{
 			_uploadService = uploadService;
-			_connectionFactory = connectionFactory;
 			_logger = logger;
 			_documentParser = documentParser;
 		}
@@ -55,6 +45,7 @@ namespace DocMgmt.Controllers
 
 		[HttpPost]
 		[ValidateAntiForgeryToken]
+		[RequestSizeLimit(FileValidator.MaxFileBytes)]
 		public async Task<IActionResult> Upload(DocumentUploadViewModel model, CancellationToken cancellationToken)
 		{
 			if (model.File is null || model.File.Length == 0)
@@ -101,103 +92,107 @@ namespace DocMgmt.Controllers
 			model.CurrentUpload = model.UploadHistory.FirstOrDefault();
 		}
 
-		// --- PIPELINE A: BEFORE-SUBMISSION PREVIEW (With Verification Checking) ---
+		// --- PIPELINE A: PREVIEW BEFORE SUBMISSION (file is parsed in memory, nothing is stored) ---
 		[HttpPost]
-		[RequestSizeLimit(104857600)]
-		public IActionResult PreviewBeforeSubmit(IFormFile file)
+		[RequestSizeLimit(FileValidator.MaxFileBytes)]
+		public async Task<IActionResult> PreviewBeforeSubmit(IFormFile? file, CancellationToken cancellationToken)
 		{
-			if (file == null || file.Length == 0)
-			{
-				return BadRequest("Invalid or empty file data.");
-			}
+			if (file is null || file.Length == 0)
+				return PreviewError(StatusCodes.Status400BadRequest, "The selected file is empty.");
+
+			if (file.Length > FileValidator.MaxFileBytes)
+				return PreviewError(StatusCodes.Status413PayloadTooLarge, "The file is larger than the 100 MB limit.");
 
 			var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
 
-			if (extension == ".docx" || extension == ".xlsx")
+			if (!FileValidator.IsOpenXml(extension))
+				return PreviewError(StatusCodes.Status400BadRequest, "Server-side preview is only used for .docx and .xlsx files.");
+
+			try
 			{
-				try
-				{
-					using var memoryStream = new MemoryStream();
-					file.CopyTo(memoryStream);
-					memoryStream.Position = 0;
+				await using var memoryStream = new MemoryStream();
+				await file.CopyToAsync(memoryStream, cancellationToken);
+				memoryStream.Position = 0;
 
-					// Verify signature matching before extracting structure
-					byte[] expectedSig = new byte[] { 0x50, 0x4B, 0x03, 0x04 };
-					byte[] actualSig = new byte[4];
-					memoryStream.Read(actualSig, 0, 4);
-					memoryStream.Position = 0; // Reset after reading signature
+				if (!FileValidator.HasValidSignature(memoryStream, extension))
+					return PreviewError(StatusCodes.Status422UnprocessableEntity,
+						"This file is not a real Word/Excel file. Its contents do not match its extension.");
 
-					if (!actualSig.SequenceEqual(expectedSig))
-					{
-						return BadRequest("Security Block: File manipulation detected. The binary header does not match a valid OpenXML Zip structure.");
-					}
-
-					var parsedContent = _documentParser.ParseFromStream(memoryStream, extension);
-					return PartialView("_DocumentPreviewPartial", parsedContent);
-				}
-				catch (Exception ex)
-				{
-					return BadRequest($"Parsing Failure: {ex.Message}");
-				}
+				var content = _documentParser.ParseFromStream(memoryStream, extension);
+				return PartialView("_DocumentPreviewPartial", content);
 			}
-
-			return BadRequest("Standard media formats are viewed directly client-side.");
+			catch (Exception ex) when (ex is InvalidDataException or XmlException)
+			{
+				_logger.LogWarning(ex, "Could not parse {FileName} for preview.", file.FileName);
+				return PreviewError(StatusCodes.Status422UnprocessableEntity,
+					"The file looks damaged or is not a valid Word/Excel file, so it cannot be previewed.");
+			}
+			catch (OperationCanceledException)
+			{
+				return new EmptyResult();
+			}
+			catch (Exception ex)
+			{
+				_logger.LogError(ex, "Unexpected preview failure for {FileName}.", file.FileName);
+				return PreviewError(StatusCodes.Status500InternalServerError, "The preview could not be generated.");
+			}
 		}
 
-		// --- PIPELINE B: AFTER-SUBMISSION PREVIEW (Serves raw bytes straight to UI layout) ---
+		// --- PIPELINE B: PREVIEW AFTER SUBMISSION (reads the stored bytes from SQL Server) ---
+		// embed=true  -> returns just the HTML fragment for the side panel
+		// embed=false -> returns a full page (used by the "Tab" link)
 		[HttpGet]
-		public async Task<IActionResult> Preview(int uploadId, CancellationToken cancellationToken)
+		public async Task<IActionResult> Preview(int uploadId, bool embed = false, CancellationToken cancellationToken = default)
 		{
-			if (uploadId <= 0) return BadRequest();
+			if (uploadId <= 0) return BadRequest("A valid upload ID is required.");
 
-			await using var connection = _connectionFactory.CreateConnection();
-			await connection.OpenAsync(cancellationToken);
-
-			var upload = await connection.QuerySingleOrDefaultAsync<PreviewFile>(
-				new CommandDefinition(
-					"""
-                    SELECT
-                        upload_id AS UploadId,
-                        doc_id AS DocId,
-                        original_file_name AS FileName,
-                        file_data AS FileData
-                    FROM dbo.DocumentUploads
-                    WHERE upload_id = @UploadId;
-                    """,
-					new { UploadId = uploadId },
-					cancellationToken: cancellationToken));
-
-			if (upload is null) return NotFound();
+			var upload = await _uploadService.GetUploadFileAsync(uploadId, cancellationToken);
+			if (upload is null) return NotFound("The requested upload was not found.");
 
 			var extension = Path.GetExtension(upload.FileName).ToLowerInvariant();
 
-			if (extension == ".docx" || extension == ".xlsx")
+			if (FileValidator.IsOpenXml(extension))
 			{
-				using var memoryStream = new MemoryStream(upload.FileData);
-				var parsedContent = _documentParser.ParseFromStream(memoryStream, extension);
-				return PartialView("_DocumentPreviewPartial", parsedContent);
+				var page = new DocumentPreviewPageViewModel
+				{
+					UploadId = upload.UploadId,
+					DocId = upload.DocId,
+					FileName = upload.FileName
+				};
+
+				try
+				{
+					using var memoryStream = new MemoryStream(upload.FileData, writable: false);
+					page.Content = _documentParser.ParseFromStream(memoryStream, extension);
+				}
+				catch (Exception ex) when (ex is InvalidDataException or XmlException)
+				{
+					_logger.LogWarning(ex, "Stored upload {UploadId} could not be parsed.", uploadId);
+					page.ErrorMessage = "The stored file looks damaged or is not a valid Word/Excel file, so it cannot be previewed. You can still download it.";
+				}
+				catch (Exception ex)
+				{
+					_logger.LogError(ex, "Unexpected preview failure for stored upload {UploadId}.", uploadId);
+					page.ErrorMessage = "The preview could not be generated. You can still download the file.";
+				}
+
+				if (embed)
+				{
+					return page.Content is not null
+						? PartialView("_DocumentPreviewPartial", page.Content)
+						: PreviewError(StatusCodes.Status422UnprocessableEntity, page.ErrorMessage ?? "Preview failed.");
+				}
+
+				return View("PreviewPage", page);
 			}
 
-			var types = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-			{
-				[".pdf"] = "application/pdf",
-				[".png"] = "image/png",
-				[".jpg"] = "image/jpeg",
-				[".jpeg"] = "image/jpeg",
-				[".gif"] = "image/gif",
-				[".webp"] = "image/webp",
-				[".mp3"] = "audio/mpeg",
-				[".wav"] = "audio/wav",
-				[".mp4"] = "video/mp4",
-				[".webm"] = "video/webm",
-				[".txt"] = "text/plain",
-				[".csv"] = "text/plain"
-			};
+			if (!FileValidator.IsInlineSafe(extension))
+				return StatusCode(StatusCodes.Status415UnsupportedMediaType,
+					"Inline preview is not supported for this file type. Use Download instead.");
 
-			if (!types.TryGetValue(extension, out var contentType))
-			{
-				return StatusCode(StatusCodes.Status415UnsupportedMediaType, "Inline preview is not supported for this file type.");
-			}
+			var contentType = FileValidator.GetContentType(extension);
+			if (contentType.StartsWith("text/", StringComparison.Ordinal))
+				contentType += "; charset=utf-8";
 
 			Response.Headers["Content-Disposition"] = "inline";
 			Response.Headers["X-Content-Type-Options"] = "nosniff";
@@ -205,12 +200,22 @@ namespace DocMgmt.Controllers
 			return File(upload.FileData, contentType);
 		}
 
-		private sealed class PreviewFile
+		[HttpGet]
+		public async Task<IActionResult> Download(int uploadId, CancellationToken cancellationToken)
 		{
-			public int UploadId { get; set; }
-			public int DocId { get; set; }
-			public string FileName { get; set; } = "";
-			public byte[] FileData { get; set; } = [];
+			if (uploadId <= 0) return BadRequest("A valid upload ID is required.");
+
+			var upload = await _uploadService.GetUploadFileAsync(uploadId, cancellationToken);
+			if (upload is null) return NotFound("The requested upload was not found.");
+
+			var extension = Path.GetExtension(upload.FileName).ToLowerInvariant();
+			Response.Headers["X-Content-Type-Options"] = "nosniff";
+
+			return File(upload.FileData, FileValidator.GetContentType(extension), upload.FileName);
 		}
+
+		// Plain-text error body: the page script shows it to the user as-is.
+		private ContentResult PreviewError(int statusCode, string message) =>
+			new() { StatusCode = statusCode, Content = message, ContentType = "text/plain; charset=utf-8" };
 	}
 }
